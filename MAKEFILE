@@ -1,0 +1,155 @@
+# SPDX-License-Identifier: MIT
+# AOS Enhanced (headless kernel) - build with:  make        (kernel.elf + bootable ISO)
+#                             make run    (QEMU + serial on this terminal)
+#
+# Build options (each combination gets its own build directory, no need to `make clean` when switching):
+#   HH=1    link the kernel proper in the higher half (0xFFFFFFFF80100000).   default 0
+#   SMP=1   start the application processors (needs APIC mode).               default 0
+#   APIC=0  never use the LAPIC/IOAPIC, stay on the legacy 8259 + PIT.        default 1
+# Tools: g++ gcc ld (binutils), grub-mkrescue + xorriso + mtools, qemu for `make run`.  nasm is NOT needed any more.
+# Output is short by default; `make V=1` shows the full compiler command lines.
+V    ?= 0
+ifeq ($(V),1)
+Q :=
+else
+Q := @
+endif
+HH   ?= 0
+SMP  ?= 0
+APIC ?= 1
+
+BUILD    := build/hh$(HH)_smp$(SMP)_apic$(APIC)
+ISO_ROOT := $(BUILD)/iso
+CXX := g++
+CC  := gcc
+LD  := ld
+# newer binutils warn about the (intentional) RWX boot segment; silence it only if the option exists
+LD_NORWX := $(shell $(LD) --help 2>/dev/null | grep -q no-warn-rwx-segments && echo --no-warn-rwx-segments)
+
+DEFS :=
+ifeq ($(HH),1)
+KOFF := 0xFFFFFFFF80000000
+DEFS += -DAOS_HH=1
+else
+KOFF := 0
+endif
+ifeq ($(SMP),1)
+DEFS += -DAOS_SMP=1
+endif
+ifeq ($(APIC),0)
+DEFS += -DAOS_NO_APIC=1
+endif
+
+COMMON_FLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie -m64 -mno-red-zone -mcmodel=large \
+                -Wall -Wextra -O2 -fno-tree-loop-distribute-patterns -MMD -MP $(DEFS)
+CXX_FLAGS := $(COMMON_FLAGS) -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++17 -Isrc/network
+C_FLAGS   := $(COMMON_FLAGS) -std=c11 -Isrc/network
+S_FLAGS   := -m64 -MMD -MP $(DEFS) -x assembler-with-cpp
+
+SRC_CXX := $(shell find src -name '*.cpp')
+SRC_C   := $(shell find src -name '*.c')
+SRC_S   := $(shell find src -name '*.S')
+OBJS := $(SRC_CXX:%=$(BUILD)/%.o) $(SRC_C:%=$(BUILD)/%.o) $(SRC_S:%=$(BUILD)/%.o)
+
+USER_PROGS := hello counter fault fsio pipedemo forkdemo vmtest
+USER_ELFS  := $(USER_PROGS:%=$(BUILD)/user/%.elf)
+
+.PHONY: selftest all run run-smp run-usb run-serial clean test test-host check user
+all: build/aos.iso
+user: $(USER_ELFS)
+
+$(BUILD)/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	@echo "  CXX  $<"
+	$(Q)$(CXX) $(CXX_FLAGS) $(CXX_EXTRA) -c $< -o $@
+
+$(BUILD)/%.c.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC   $<"
+	$(Q)$(CC) $(C_FLAGS) -c $< -o $@
+
+$(BUILD)/%.S.o: %.S
+	@mkdir -p $(dir $@)
+	@echo "  AS   $<"
+	$(Q)$(CC) $(S_FLAGS) -c $< -o $@
+
+# Code that runs in interrupt context must not touch SSE registers by itself (interrupts.S also saves FXSAVE state).
+$(BUILD)/src/arch/x86_64/interrupts.cpp.o: CXX_EXTRA := -mgeneral-regs-only
+$(BUILD)/src/drivers/ps2_mouse.cpp.o:       CXX_EXTRA := -mgeneral-regs-only
+
+$(BUILD)/kernel.elf: $(OBJS) linker.ld
+	@echo "  LD   $@"
+	$(Q)$(LD) -n --gc-sections -z noexecstack $(LD_NORWX) --defsym=KOFF=$(KOFF) -T linker.ld -o $@ $(OBJS)
+
+# User programs: static ELF at 0x8000000000, no libc.
+$(BUILD)/user/%.elf: user/%.c user/crt0.S user/user.ld user/libaos.h
+	@mkdir -p $(dir $@)
+	@echo "  USER $<"
+	$(Q)$(CC) -O2 -Wall -ffreestanding -nostdlib -static -fno-pic -fno-pie -no-pie -fno-stack-protector -mcmodel=large \
+	      -Wl,--build-id=none,-n,-z,max-page-size=4096,-z,noexecstack -Wl,-T,user/user.ld -o $@ user/crt0.S $<
+
+$(BUILD)/aos.iso: $(BUILD)/kernel.elf grub.cfg resources/initramfs/README.TXT $(USER_ELFS)
+	@echo "  ISO  $@"
+	@mkdir -p $(ISO_ROOT)/boot/grub
+	@cp $(BUILD)/kernel.elf $(ISO_ROOT)/boot/kernel.elf
+	@cp grub.cfg $(ISO_ROOT)/boot/grub/grub.cfg
+	@tar -cf $(ISO_ROOT)/boot/initramfs.tar -C resources/initramfs README.TXT
+	@tar -rf $(ISO_ROOT)/boot/initramfs.tar -C $(BUILD)/user $(USER_PROGS:%=%.elf)
+	@grub-mkrescue -o $@ $(ISO_ROOT) >/dev/null 2>&1
+
+build/aos.iso: $(BUILD)/aos.iso
+	@cp $< $@
+
+build/aos-data.img:
+	@mkdir -p build
+	qemu-img create -f raw $@ 16M >/dev/null
+
+run: build/aos.iso build/aos-data.img
+	qemu-system-x86_64 $(KVM) -cdrom build/aos.iso \
+		-drive file=build/aos-data.img,format=raw,if=ide,index=0 \
+		-m 512M -serial stdio \
+		-netdev user,id=n0 -device e1000,netdev=n0
+
+# SMP test: 4 CPUs (build with SMP=1)
+run-smp: build/aos.iso build/aos-data.img
+	qemu-system-x86_64 $(KVM) -smp 4 -cdrom build/aos.iso \
+		-drive file=build/aos-data.img,format=raw,if=ide,index=0 \
+		-m 512M -nographic
+
+
+KVM := $(shell test -w /dev/kvm && echo -enable-kvm -cpu host)
+
+# USB test: xHCI controller + USB mouse + USB tablet (absolute pointer). Watch serial for "[usb] ..." lines.
+run-usb: build/aos.iso build/aos-data.img
+	qemu-system-x86_64 $(KVM) -cdrom build/aos.iso \
+		-drive file=build/aos-data.img,format=raw,if=ide,index=0 \
+		-m 512M -serial stdio \
+		-netdev user,id=n0 -device e1000,netdev=n0 \
+		-device qemu-xhci,id=xhci -device usb-mouse,bus=xhci.0 -device usb-tablet,bus=xhci.0
+
+# no window: serial shell on this terminal (same as `run`, minus the QEMU display)
+run-serial: build/aos.iso build/aos-data.img
+	qemu-system-x86_64 $(KVM) -cdrom build/aos.iso \
+		-drive file=build/aos-data.img,format=raw,if=ide,index=0 \
+		-m 512M -nographic \
+		-netdev user,id=n0 -device e1000,netdev=n0
+
+# Static checks of the kernel image (Multiboot2 header, entry point, load layout) - no emulator needed.
+test: $(BUILD)/kernel.elf
+	@python3 tools/check_kernel.py $(BUILD)/kernel.elf $(HH)
+
+# Host-side unit tests (scheduler policy, MADT/IOAPIC routing, ELF loader, address spaces).
+test-host:
+	@$(MAKE) -C tests/host run
+
+check: test test-host
+
+# One command: install tools if needed, build every configuration, boot each in QEMU, run the whole test suite
+# and write selftest_report/REPORT.md + selftest_report.zip.   Options:  make selftest ARGS="--quick"
+selftest:
+	@python3 tools/selftest.py $(ARGS)
+
+clean:
+	rm -rf build
+
+-include $(OBJS:.o=.d)
