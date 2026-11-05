@@ -1,0 +1,32 @@
+AOS (headless) on real hardware (UEFI)
+==================================================
+1. BIOS (F10 at power-on): Secure Boot = OFF  (the ISO is not signed).
+2. Write the ISO to a USB stick (this ERASES the stick; check the device name with lsblk!):
+     sudo dd if=aos.iso of=/dev/sdX bs=4M status=progress conv=fsync
+   (Ventoy: boot the ISO in "GRUB2 mode" if normal mode fails.)
+3. F9 at power-on -> boot menu -> pick the USB stick (UEFI).
+
+Known limits on real hardware
+ - Keyboard works if the laptop's keyboard is PS/2-style (most are).
+ - Pointing devices: PS/2 mouse/touchpad, USB mice/tablets/touchpads via xHCI (root ports only, no hubs yet),
+   and I2C-HID touchpads (AMD/Intel DesignWare I2C, found through ACPI, polled; best effort).
+   Touchpad gestures: tap = click, 2-finger tap = right click, 3-finger tap = middle click,
+   tap-and-drag, 2-finger scroll, clickpad right-click zone (bottom-right).
+   Watch the serial console for "[usb]" / "[i2c]" lines if a device does not show up.
+ - NVMe SSD: supported (read + write). Files are ALWAYS stored on disk now - there is no RAM storage.
+   AOS only touches a partition you explicitly give it. It never auto-formats an NVMe disk.
+   One-time setup (keeps Windows/Linux safe):
+     1. In Windows Disk Management shrink a volume by e.g. 10-100 GB, then create a new simple volume in the
+        free space and choose "Do not format this volume" (an unformatted partition). Max 2 GiB is used.
+     2. Boot AOS, on the serial shell run:   disks
+        note the disk number and partition number of that empty partition.
+     3. Run:   mkaosfs <disk> <part> CONFIRM
+        (refuses EFI/recovery/reserved partitions; a partition that already has NTFS/FAT/ext needs FORCE).
+     4. Reboot. AOS finds the AOSFS partition by itself and mounts it on every boot.
+   Tip: give the partition the AOS GPT type GUID 4D53414F-0001-4A5B-9C3D-5E6F7A8B9C0D (gdisk/parted) for a label of "AOS".
+ - Wi-Fi / Realtek LAN: no driver (only e1000 / PCnet).
+ - Headless: nothing is drawn on the screen. You need a serial console (UART) to use the shell; most laptops have none.
+   Use QEMU / a PC with a COM1 port, or a serial-over-LAN capable board. Without a UART the machine boots but you see nothing.
+
+Shell: 'poweroff' / 'shutdown' / 'reboot' / 'beep'.
+QEMU audio: add  -audiodev pa,id=snd0 -device intel-hda -device hda-output,audiodev=snd0   (use 'alsa' or 'sdl' instead of 'pa' if needed)
